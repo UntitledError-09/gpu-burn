@@ -58,7 +58,7 @@
 #include <vector>
 #include <regex>
 
-#define SIGTERM_TIMEOUT_THRESHOLD_SECS 30 // number of seconds for sigterm to kill child processes before forcing a sigkill
+#define SIGTERM_TIMEOUT_THRESHOLD_SECS 5 // number of seconds for sigterm to kill child processes before forcing a sigkill
 
 #include "cublas_v2.h"
 #define CUDA_ENABLE_DEPRECATED
@@ -104,6 +104,9 @@ double getTime() {
 }
 
 bool g_running = false;
+bool g_repetitionMode = false;  // Flag to indicate if we're in repetition mode
+unsigned long long g_targetRepetitions = 0;  // Target number of repetitions
+unsigned long long g_completedRepetitions = 0;  // Counter for completed repetitions
 
 template <class T> class GPU_Test {
   public:
@@ -151,6 +154,12 @@ template <class T> class GPU_Test {
         unsigned long long int tempErrs = d_error;
         d_error = 0;
         return tempErrs;
+    }
+
+    unsigned long long int getRepetitionsCompleted() { 
+        unsigned long long tempReps = d_completedRepetitions;
+        d_completedRepetitions = 0;
+        return tempReps;
     }
 
     size_t getIters() { return d_iters; }
@@ -228,6 +237,7 @@ template <class T> class GPU_Test {
                                 (float *)d_Cdata + i * SIZE * SIZE, SIZE),
                     "SGEMM");
         }
+        d_completedRepetitions += d_iters;
     }
 
     void initCompareKernel() {
@@ -296,6 +306,7 @@ template <class T> class GPU_Test {
     int *d_faultyElemsHost;
 
     cublasHandle_t d_cublas;
+    unsigned long long d_completedRepetitions = 0;
 };
 
 // Returns the number of devices
@@ -359,6 +370,12 @@ void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
             write(writeFd, &ops, sizeof(int));
             ops = our->getErrors();
             write(writeFd, &ops, sizeof(int));
+            
+            // Send repetitions count if in repetition mode
+            if (g_repetitionMode) {
+                unsigned long long reps = our->getRepetitionsCompleted();
+                write(writeFd, &reps, sizeof(unsigned long long));
+            }
         }
 
         for (int i = 0; i < maxEvents; ++i)
@@ -463,13 +480,16 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     std::vector<struct timespec> clientUpdateTime;
     std::vector<float> clientGflops;
     std::vector<bool> clientFaulty;
+    std::vector<unsigned long long> clientRepetitions;
 
     time_t startTime = time(0);
+    time_t endTime = startTime + runTime;
 
     for (size_t i = 0; i < clientFd.size(); ++i) {
         clientTemp.push_back(0);
         clientErrors.push_back(0);
         clientCalcs.push_back(0);
+        clientRepetitions.push_back(0);
         struct timespec thisTime;
         clock_gettime(CLOCK_REALTIME, &thisTime);
         clientUpdateTime.push_back(thisTime);
@@ -498,6 +518,14 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 }
                 // Then errors
                 read(clientFd.at(i), &errors, sizeof(int));
+
+                // Read repetitions if in repetition mode
+                unsigned long long reps = 0;
+                if (g_repetitionMode) {
+                    read(clientFd.at(i), &reps, sizeof(unsigned long long));
+                    clientRepetitions.at(i) += reps;
+                    g_completedRepetitions += reps;
+                }
 
                 clientErrors.at(i) += errors;
                 if (processed == -1)
@@ -533,10 +561,20 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
         // Printing progress (if a child has initted already)
         if (childReport) {
-            float elapsed =
-                fminf((float)(thisTime - startTime) / (float)runTime * 100.0f,
-                      100.0f);
+            float elapsed;
+            if (g_repetitionMode) {
+                elapsed = fminf((float)g_completedRepetitions / (float)g_targetRepetitions * 100.0f, 100.0f);
+            } else {
+                elapsed = fminf((float)(thisTime - startTime) / (float)runTime * 100.0f, 100.0f);
+            }
+            
             printf("\r%.1f%%  ", elapsed);
+            
+            if (g_repetitionMode) {
+                printf("reps: %llu/%llu  ", g_completedRepetitions, g_targetRepetitions);
+                printf("elapsed: %lds  ", thisTime - startTime);
+            }
+            
             printf("proc'd: ");
             for (size_t i = 0; i < clientCalcs.size(); ++i) {
                 printf("%d (%.0f Gflop/s) ", clientCalcs.at(i),
@@ -592,8 +630,14 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             exit(ENOMEDIUM);
         }
 
-        if (startTime + runTime < thisTime)
-            break;
+        // Check if we should exit based on time or repetitions
+        if (g_repetitionMode) {
+            if (g_completedRepetitions >= g_targetRepetitions)
+                break;
+        } else {
+            if (thisTime >= endTime)
+                break;
+        }
     }
 
     printf("\nKilling processes with SIGTERM (soft kill)\n");
@@ -764,7 +808,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
 
 void showHelp() {
     printf("GPU Burn\n");
-    printf("Usage: gpu-burn [OPTIONS] [TIME]\n\n");
+    printf("Usage: gpu-burn [OPTIONS] [TIME|REPETITIONS]\n\n");
     printf("-m X\tUse X MB of memory.\n");
     printf("-m N%%\tUse N%% of the available GPU memory.  Default is %d%%\n",
            (int)(USEMEM * 100));
@@ -776,9 +820,11 @@ void showHelp() {
            COMPARE_KERNEL);
     printf("-stts T\tSet timeout threshold to T seconds for using SIGTERM to abort child processes before using SIGKILL.  Default is %d\n",
            SIGTERM_TIMEOUT_THRESHOLD_SECS);
+    printf("-r\tRun for a specific number of operations instead of a time duration\n");
     printf("-h\tShow this help message\n\n");
     printf("Examples:\n");
     printf("  gpu-burn -d 3600 # burns all GPUs with doubles for an hour\n");
+    printf("  gpu-burn -r 1000 # burns all GPUs for 1000 operations and measures time\n");
     printf(
         "  gpu-burn -m 50%% # burns using 50%% of the available GPU memory\n");
     printf("  gpu-burn -l # list GPUs\n");
@@ -800,8 +846,10 @@ ssize_t decodeUSEMEM(const char *s) {
 
 int main(int argc, char **argv) {
     int runLength = 10;
+    unsigned long long repetitions = 0;
     bool useDoubles = false;
     bool useTensorCores = false;
+    bool useRepetitionMode = false;
     int thisParam = 0;
     ssize_t useBytes = 0; // 0 == use USEMEM% of free mem
     int device_id = -1;
@@ -839,6 +887,11 @@ int main(int argc, char **argv) {
         if (argc >= 2 &&
             std::string(argv[i]).find("-tc") != std::string::npos) {
             useTensorCores = true;
+            thisParam++;
+        }
+        if (argc >= 2 && std::string(argv[i]).find("-r") != std::string::npos) {
+            useRepetitionMode = true;
+            g_repetitionMode = true;
             thisParam++;
         }
         if (argc >= 2 && strncmp(argv[i], "-m", 2) == 0) {
@@ -893,12 +946,24 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (argc - thisParam < 2)
-        printf("Run length not specified in the command line. ");
-    else
-        runLength = atoi(argv[1 + thisParam]);
+    if (argc - thisParam < 2) {
+        if (useRepetitionMode) {
+            printf("Number of repetitions not specified in the command line.\n");
+            return 1;
+        } else {
+            printf("Run length not specified in the command line.\n");
+        }
+    } else {
+        if (useRepetitionMode) {
+            repetitions = strtoull(argv[1 + thisParam], NULL, 10);
+            g_targetRepetitions = repetitions;
+            printf("Target repetitions: %llu\n", repetitions);
+        } else {
+            runLength = atoi(argv[1 + thisParam]);
+            printf("Burning for %d seconds.\n", runLength);
+        }
+    }
     printf("Using compare file: %s\n", kernelFile);
-    printf("Burning for %d seconds.\n", runLength);
 
     if (useDoubles)
         launch<double>(runLength, useDoubles, useTensorCores, useBytes,

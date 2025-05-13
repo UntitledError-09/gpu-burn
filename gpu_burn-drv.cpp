@@ -484,6 +484,8 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
     time_t startTime = time(0);
     time_t endTime = startTime + runTime;
+    std::chrono::high_resolution_clock::time_point highResStartTime = 
+        std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < clientFd.size(); ++i) {
         clientTemp.push_back(0);
@@ -638,6 +640,25 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             if (thisTime >= endTime)
                 break;
         }
+    }
+
+    // Calculate and print performance metrics
+    auto highResEndTime = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsedTime = highResEndTime - highResStartTime;
+    double totalSeconds = elapsedTime.count();
+    
+    if (g_repetitionMode) {
+        printf("\n\n========== PERFORMANCE SUMMARY ==========\n");
+        printf("Total repetitions completed: %llu\n", g_completedRepetitions);
+        printf("Critical runtime: %.2f seconds\n", totalSeconds);
+        double averageOpsPerSec = g_completedRepetitions / totalSeconds;
+        printf("Average operations per second: %.2f ops/sec\n", averageOpsPerSec);
+        
+        // Calculate GFLOPS based on operations completed
+        double totalGflops = (double)g_completedRepetitions * (double)OPS_PER_MUL / 
+                             (totalSeconds * 1.0e9);
+        printf("Aggregate performance: %.2f GFLOP/s\n", totalGflops);
+        printf("=========================================\n\n");
     }
 
     printf("\nKilling processes with SIGTERM (soft kill)\n");

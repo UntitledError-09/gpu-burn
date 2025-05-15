@@ -648,17 +648,9 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     double totalSeconds = elapsedTime.count();
     
     if (g_repetitionMode) {
-        printf("\n\n========== PERFORMANCE SUMMARY ==========\n");
-        printf("Total repetitions completed: %llu\n", g_completedRepetitions);
-        printf("Critical runtime: %.2f seconds\n", totalSeconds);
-        double averageOpsPerSec = g_completedRepetitions / totalSeconds;
-        printf("Average operations per second: %.2f ops/sec\n", averageOpsPerSec);
-        
-        // Calculate GFLOPS based on operations completed
-        double totalGflops = (double)g_completedRepetitions * (double)OPS_PER_MUL / 
-                             (totalSeconds * 1.0e9);
-        printf("Aggregate performance: %.2f GFLOP/s\n", totalGflops);
-        printf("=========================================\n\n");
+        printf("\n\nPERFORMANCE SUMMARY: %llu reps, %.2f seconds, %.2f ops/sec, %.2f GFLOP/s\n", 
+            g_completedRepetitions, totalSeconds, g_completedRepetitions / totalSeconds, 
+            (double)g_completedRepetitions * (double)OPS_PER_MUL / (totalSeconds * 1.0e9));
     }
 
     printf("\nKilling processes with SIGTERM (soft kill)\n");
